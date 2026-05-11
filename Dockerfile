@@ -9,7 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
     CRON_SCHEDULE="0 0 * * *" \
     RUN_ON_STARTUP=true \
     TZ=Asia/Shanghai \
-    LOG_LEVEL=DEBUG
+    LOG_LEVEL=INFO \
+    LOG_LANGUAGE=en
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl skopeo tzdata \

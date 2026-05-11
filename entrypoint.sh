@@ -9,7 +9,8 @@ CRON_FILE=/tmp/harbor2oss.cron
 JOB_ARGS=${JOB_ARGS:-}
 
 echo "[entrypoint] timezone: ${TZ:-unset}"
-echo "[entrypoint] log level: ${LOG_LEVEL:-DEBUG}"
+echo "[entrypoint] log level: ${LOG_LEVEL:-INFO}"
+echo "[entrypoint] log language: ${LOG_LANGUAGE:-en}"
 echo "[entrypoint] job args: ${JOB_ARGS:-<none>}"
 
 if [ "${RUN_ON_STARTUP:-true}" = "true" ]; then
