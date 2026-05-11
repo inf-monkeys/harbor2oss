@@ -55,6 +55,9 @@ class Config:
     upload_threads: int
     repo_filter: str | None
     lock_file: str
+    network_retries: int
+    retry_base_delay_seconds: float
+    harbor_request_timeout: float
 
 
 @dataclass(frozen=True)
@@ -80,7 +83,7 @@ class JobError(RuntimeError):
 def env(name: str, default: str | None = None, required: bool = False) -> str:
     value = os.getenv(name, default)
     if required and not value:
-        raise JobError(f"Missing required environment variable: {name}")
+        raise JobError(f"缺少必需的环境变量：{name}")
     return value or ""
 
 
@@ -98,7 +101,17 @@ def env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError as exc:
-        raise JobError(f"{name} must be an integer, got {raw!r}") from exc
+        raise JobError(f"{name} 必须是整数，当前值为 {raw!r}") from exc
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise JobError(f"{name} 必须是数字，当前值为 {raw!r}") from exc
 
 
 def load_config(args: argparse.Namespace) -> Config:
@@ -106,7 +119,16 @@ def load_config(args: argparse.Namespace) -> Config:
     registry = env("HARBOR_REGISTRY", urlparse(harbor_url).netloc, required=True)
     keep_tags = args.keep_tags if args.keep_tags is not None else env_int("KEEP_TAGS", 10)
     if keep_tags < 0:
-        raise JobError("KEEP_TAGS must be >= 0")
+        raise JobError("KEEP_TAGS 必须大于等于 0")
+    network_retries = env_int("NETWORK_RETRIES", 3)
+    if network_retries < 0:
+        raise JobError("NETWORK_RETRIES 必须大于等于 0")
+    retry_base_delay_seconds = env_float("RETRY_BASE_DELAY_SECONDS", 5.0)
+    if retry_base_delay_seconds < 0:
+        raise JobError("RETRY_BASE_DELAY_SECONDS 必须大于等于 0")
+    harbor_request_timeout = env_float("HARBOR_REQUEST_TIMEOUT", 60.0)
+    if harbor_request_timeout <= 0:
+        raise JobError("HARBOR_REQUEST_TIMEOUT 必须大于 0")
     return Config(
         harbor_url=harbor_url,
         harbor_user=env("HARBOR_USER", required=True),
@@ -126,6 +148,9 @@ def load_config(args: argparse.Namespace) -> Config:
         upload_threads=env_int("OSS_UPLOAD_THREADS", 4),
         repo_filter=args.repo or os.getenv("REPO_FILTER") or None,
         lock_file=env("LOCK_FILE", DEFAULT_LOCK_FILE),
+        network_retries=network_retries,
+        retry_base_delay_seconds=retry_base_delay_seconds,
+        harbor_request_timeout=harbor_request_timeout,
     )
 
 
@@ -136,7 +161,7 @@ def parse_time(value: str | None) -> datetime:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        logging.warning("Unable to parse timestamp %r; treating as oldest", value)
+        logging.warning("无法解析时间戳 %r，将按最旧时间处理", value)
         return datetime.fromtimestamp(0, tz=timezone.utc)
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
@@ -167,10 +192,47 @@ def create_harbor_session(config: Config) -> requests.Session:
     return session
 
 
-def api_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
-    response = session.get(url, timeout=60, **kwargs)
-    response.raise_for_status()
-    return response
+def retry_delay(config: Config, retry_index: int) -> float:
+    return config.retry_base_delay_seconds * (2 ** max(retry_index - 1, 0))
+
+
+def retryable_harbor_error(exc: requests.exceptions.RequestException) -> bool:
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return False
+
+
+def api_request(session: requests.Session, config: Config, method: str, url: str, **kwargs) -> requests.Response:
+    attempts = config.network_retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.request(method, url, timeout=config.harbor_request_timeout, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            if attempt >= attempts or not retryable_harbor_error(exc):
+                raise
+            delay = retry_delay(config, attempt)
+            logging.warning(
+                "Harbor %s 第 %d/%d 次请求失败：%s；%.1f 秒后重试",
+                method.upper(),
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    raise JobError(f"Harbor {method.upper()} 请求异常失败：{url}")
+
+
+def api_get(session: requests.Session, config: Config, url: str, **kwargs) -> requests.Response:
+    return api_request(session, config, "GET", url, **kwargs)
+
+
+def api_delete(session: requests.Session, config: Config, url: str, **kwargs) -> requests.Response:
+    return api_request(session, config, "DELETE", url, **kwargs)
 
 
 def list_repositories(session: requests.Session, config: Config) -> list[str]:
@@ -179,6 +241,7 @@ def list_repositories(session: requests.Session, config: Config) -> list[str]:
     while True:
         response = api_get(
             session,
+            config,
             f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories",
             params={"page_size": 100, "page": page},
         )
@@ -190,10 +253,10 @@ def list_repositories(session: requests.Session, config: Config) -> list[str]:
             if not name:
                 continue
             if config.repo_filter and config.repo_filter not in name:
-                logging.debug("Skip repository %s due to filter %r", name, config.repo_filter)
+                logging.debug("仓库 %s 不匹配过滤条件 %r，跳过", name, config.repo_filter)
                 continue
             repos.append(name)
-        logging.debug("Fetched repository page %d: %d item(s)", page, len(data))
+        logging.debug("已获取仓库列表第 %d 页：%d 项", page, len(data))
         page += 1
     return repos
 
@@ -201,7 +264,7 @@ def list_repositories(session: requests.Session, config: Config) -> list[str]:
 def repo_path_from_name(config: Config, repo_name: str) -> str:
     prefix = f"{config.harbor_project}/"
     if not repo_name.startswith(prefix):
-        raise JobError(f"Unexpected repository name from Harbor: {repo_name}")
+        raise JobError(f"Harbor 返回了非预期的仓库名：{repo_name}")
     return repo_name[len(prefix) :]
 
 
@@ -213,6 +276,7 @@ def list_artifacts(session: requests.Session, config: Config, repo_name: str) ->
     while True:
         response = api_get(
             session,
+            config,
             f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts",
             params={"page_size": 100, "page": page, "with_tag": "true"},
         )
@@ -239,7 +303,7 @@ def list_artifacts(session: requests.Session, config: Config, repo_name: str) ->
                     size=int(raw.get("size") or 0),
                 )
             )
-        logging.debug("Fetched artifact page %d for %s: %d item(s)", page, repo_name, len(data))
+        logging.debug("已获取仓库 %s 的制品第 %d 页：%d 项", repo_name, page, len(data))
         page += 1
     return artifacts
 
@@ -262,48 +326,118 @@ def oss_key_for(config: Config, repo_path: str, tag: str) -> str:
 def init_oss_bucket(config: Config) -> oss2.Bucket:
     auth = oss2.Auth(config.oss_access_key_id, config.oss_access_key_secret)
     bucket = oss2.Bucket(auth, config.oss_endpoint, config.oss_bucket)
-    bucket.get_bucket_info()
+    attempts = config.network_retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            bucket.get_bucket_info()
+            break
+        except Exception as exc:
+            if attempt >= attempts or not retryable_oss_error(exc):
+                raise
+            delay = retry_delay(config, attempt)
+            logging.warning(
+                "OSS bucket 检查第 %d/%d 次失败：%s；%.1f 秒后重试",
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
     return bucket
 
 
-def oss_exists(bucket: oss2.Bucket, key: str) -> bool:
-    try:
-        bucket.head_object(key)
-        logging.debug("OSS exists: %s", key)
+def retryable_oss_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
         return True
-    except oss2.exceptions.NotFound:
-        logging.debug("OSS missing: %s", key)
-        return False
-    except oss2.exceptions.OssError as exc:
-        if getattr(exc, "status", None) == 404:
-            logging.debug("OSS missing: %s", key)
+    if isinstance(exc, oss2.exceptions.RequestError):
+        return True
+    if isinstance(exc, oss2.exceptions.OssError):
+        status = getattr(exc, "status", None)
+        return status is None or status == 429 or status >= 500
+    return False
+
+
+def oss_exists(config: Config, bucket: oss2.Bucket, key: str) -> bool:
+    attempts = config.network_retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            bucket.head_object(key)
+            logging.debug("OSS 对象已存在：%s", key)
+            return True
+        except oss2.exceptions.NotFound:
+            logging.debug("OSS 对象不存在：%s", key)
             return False
-        raise
+        except oss2.exceptions.OssError as exc:
+            if getattr(exc, "status", None) == 404:
+                logging.debug("OSS 对象不存在：%s", key)
+                return False
+            if attempt >= attempts or not retryable_oss_error(exc):
+                raise
+            delay = retry_delay(config, attempt)
+            logging.warning(
+                "OSS HEAD 检查 %s 第 %d/%d 次失败：%s；%.1f 秒后重试",
+                key,
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    raise JobError(f"OSS HEAD 检查异常失败：{key}")
 
 
 def upload_to_oss(config: Config, bucket: oss2.Bucket, local_path: Path, oss_key: str) -> None:
+    attempts = config.network_retries + 1
     size = local_path.stat().st_size
-    if size < 100 * 1024 * 1024:
-        logging.debug("Using single-part OSS upload for %s", oss_key)
-        result = bucket.put_object_from_file(oss_key, str(local_path))
-    else:
-        logging.debug(
-            "Using multipart OSS upload for %s: part_size=%s threads=%d",
-            oss_key,
-            human_size(10 * 1024 * 1024),
-            config.upload_threads,
-        )
-        result = oss2.resumable_upload(
-            bucket,
-            oss_key,
-            str(local_path),
-            multipart_threshold=100 * 1024 * 1024,
-            part_size=10 * 1024 * 1024,
-            num_threads=config.upload_threads,
-        )
-    status = getattr(result, "status", None)
-    if status is not None and not (200 <= status < 300):
-        raise JobError(f"OSS upload failed for {oss_key}: HTTP {status}")
+    for attempt in range(1, attempts + 1):
+        try:
+            if size < 100 * 1024 * 1024:
+                logging.debug("使用单文件方式上传 OSS：%s", oss_key)
+                result = bucket.put_object_from_file(oss_key, str(local_path))
+            else:
+                logging.debug(
+                    "使用 OSS 分片上传：%s，分片大小=%s，并发=%d",
+                    oss_key,
+                    human_size(10 * 1024 * 1024),
+                    config.upload_threads,
+                )
+                result = oss2.resumable_upload(
+                    bucket,
+                    oss_key,
+                    str(local_path),
+                    multipart_threshold=100 * 1024 * 1024,
+                    part_size=10 * 1024 * 1024,
+                    num_threads=config.upload_threads,
+            )
+            status = getattr(result, "status", None)
+            if status is not None and not (200 <= status < 300):
+                if attempt < attempts and (status == 429 or status >= 500):
+                    delay = retry_delay(config, attempt)
+                    logging.warning(
+                        "OSS 上传 %s 第 %d/%d 次失败，HTTP %s；%.1f 秒后重试",
+                        oss_key,
+                        attempt,
+                        attempts,
+                        status,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise JobError(f"OSS 上传失败：{oss_key}，HTTP {status}")
+            return
+        except Exception as exc:
+            if attempt >= attempts or not retryable_oss_error(exc):
+                raise
+            delay = retry_delay(config, attempt)
+            logging.warning(
+                "OSS 上传 %s 第 %d/%d 次失败：%s；%.1f 秒后重试",
+                oss_key,
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
 
 
 def write_skopeo_auth(config: Config, directory: Path) -> Path:
@@ -316,7 +450,7 @@ def write_skopeo_auth(config: Config, directory: Path) -> Path:
         encoding="utf-8",
     )
     auth_file.chmod(0o600)
-    logging.debug("Wrote temporary skopeo auth file: %s", auth_file)
+    logging.debug("已写入临时 skopeo 认证文件：%s", auth_file)
     return auth_file
 
 
@@ -334,9 +468,9 @@ def run_skopeo_copy(config: Config, auth_file: Path, image: str, tar_path: Path)
         f"docker://{image}",
         f"docker-archive:{tar_path}:{image}",
     ]
-    logging.info("Exporting %s with skopeo", image)
+    logging.info("正在用 skopeo 导出镜像：%s", image)
     logging.debug(
-        "skopeo copy source=docker://%s target=docker-archive:%s override=%s/%s tls_verify=%s",
+        "skopeo copy 源=docker://%s 目标=docker-archive:%s 平台=%s/%s tls_verify=%s",
         image,
         tar_path,
         config.skopeo_override_os,
@@ -347,7 +481,7 @@ def run_skopeo_copy(config: Config, auth_file: Path, image: str, tar_path: Path)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
-        raise JobError(f"skopeo copy failed for {image}: {stderr or stdout}")
+        raise JobError(f"skopeo 导出镜像失败：{image}：{stderr or stdout}")
 
 
 def backup_tag(
@@ -361,17 +495,17 @@ def backup_tag(
     image = f"{config.harbor_registry}/{artifact.repo_name}:{tag.name}"
     key = oss_key_for(config, artifact.repo_path, tag.name)
     logging.debug(
-        "Backup check image=%s digest=%s tag_push_time=%s oss_key=%s",
+        "备份检查 image=%s digest=%s tag_push_time=%s oss_key=%s",
         image,
         artifact.digest,
         tag.push_time.isoformat(),
         key,
     )
-    if oss_exists(bucket, key):
-        logging.info("OSS already has %s", key)
+    if oss_exists(config, bucket, key):
+        logging.info("OSS 已存在：%s", key)
         return False
     if dry_run:
-        logging.info("[dry-run] would back up %s -> oss://%s/%s", image, config.oss_bucket, key)
+        logging.info("[dry-run] 将备份 %s -> oss://%s/%s", image, config.oss_bucket, key)
         return False
 
     tmp_root = Path(config.tmp_dir)
@@ -379,30 +513,30 @@ def backup_tag(
     with tempfile.TemporaryDirectory(prefix="image_", dir=str(tmp_root)) as work_dir:
         work_path = Path(work_dir)
         tar_path = work_path / "image.tar"
-        logging.debug("Created temporary work directory for %s: %s", image, work_path)
+        logging.debug("已为 %s 创建临时工作目录：%s", image, work_path)
         try:
             run_skopeo_copy(config, auth_file, image, tar_path)
             size = tar_path.stat().st_size
-            logging.info("Uploading %s (%s) -> oss://%s/%s", image, human_size(size), config.oss_bucket, key)
+            logging.info("正在上传 %s（%s）-> oss://%s/%s", image, human_size(size), config.oss_bucket, key)
             upload_to_oss(config, bucket, tar_path, key)
-            logging.info("Backed up %s", image)
+            logging.info("备份完成：%s", image)
             return True
         finally:
             with contextlib.suppress(FileNotFoundError):
                 tar_path.unlink()
-                logging.debug("Removed temporary tar for %s: %s", image, tar_path)
+                logging.debug("已删除 %s 的临时 tar：%s", image, tar_path)
 
 
 def artifact_fully_backed_up(config: Config, bucket: oss2.Bucket, artifact: ArtifactRef) -> bool:
     if not artifact.tags:
-        logging.debug("Artifact %s has no tags; treating as not backed up", artifact.digest)
+        logging.debug("制品 %s 没有 tag，按未备份处理", artifact.digest)
         return False
     for tag in artifact.tags:
         key = oss_key_for(config, artifact.repo_path, tag.name)
-        if not oss_exists(bucket, key):
-            logging.debug("Artifact %s is not fully backed up; missing tag %s", artifact.digest, tag.name)
+        if not oss_exists(config, bucket, key):
+            logging.debug("制品 %s 尚未完整备份，缺少 tag %s", artifact.digest, tag.name)
             return False
-    logging.debug("Artifact %s is fully backed up", artifact.digest)
+    logging.debug("制品 %s 已完整备份", artifact.digest)
     return True
 
 
@@ -411,21 +545,21 @@ def delete_artifact(session: requests.Session, config: Config, artifact: Artifac
     encoded_digest = url_quote(artifact.digest, safe="")
     tag_names = ", ".join(tag.name for tag in artifact.tags) or "<untagged>"
     logging.debug(
-        "Delete artifact request repo=%s digest=%s tags=[%s] size=%s",
+        "准备删除制品 repo=%s digest=%s tags=[%s] size=%s",
         artifact.repo_name,
         artifact.digest,
         tag_names,
         human_size(artifact.size),
     )
     if dry_run:
-        logging.info("[dry-run] would delete artifact %s/%s@%s tags=[%s]", config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
+        logging.info("[dry-run] 将删除制品 %s/%s@%s tags=[%s]", config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
         return False
-    response = session.delete(
+    response = api_delete(
+        session,
+        config,
         f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}",
-        timeout=60,
     )
-    response.raise_for_status()
-    logging.info("Deleted artifact %s/%s@%s tags=[%s]", config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
+    logging.info("已删除制品 %s/%s@%s tags=[%s]", config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
     return True
 
 
@@ -433,21 +567,21 @@ def delete_tag(session: requests.Session, config: Config, artifact: ArtifactRef,
     encoded_repo = url_quote(artifact.repo_path, safe="")
     encoded_digest = url_quote(artifact.digest, safe="")
     encoded_tag = url_quote(tag.name, safe="")
-    logging.debug("Delete tag request repo=%s digest=%s tag=%s", artifact.repo_name, artifact.digest, tag.name)
+    logging.debug("准备删除 tag repo=%s digest=%s tag=%s", artifact.repo_name, artifact.digest, tag.name)
     if dry_run:
-        logging.info("[dry-run] would delete tag %s/%s:%s", config.harbor_project, artifact.repo_path, tag.name)
+        logging.info("[dry-run] 将删除 tag %s/%s:%s", config.harbor_project, artifact.repo_path, tag.name)
         return False
-    response = session.delete(
+    response = api_delete(
+        session,
+        config,
         f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}/tags/{encoded_tag}",
-        timeout=60,
     )
-    response.raise_for_status()
-    logging.info("Deleted tag %s/%s:%s", config.harbor_project, artifact.repo_path, tag.name)
+    logging.info("已删除 tag %s/%s:%s", config.harbor_project, artifact.repo_path, tag.name)
     return True
 
 
 def tag_is_backed_up(config: Config, bucket: oss2.Bucket, artifact: ArtifactRef, tag: TagRef) -> bool:
-    return oss_exists(bucket, oss_key_for(config, artifact.repo_path, tag.name))
+    return oss_exists(config, bucket, oss_key_for(config, artifact.repo_path, tag.name))
 
 
 def retention_plan(artifacts: list[ArtifactRef], keep_tags: int) -> tuple[list[ArtifactRef], list[tuple[ArtifactRef, TagRef]]]:
@@ -458,7 +592,7 @@ def retention_plan(artifacts: list[ArtifactRef], keep_tags: int) -> tuple[list[A
 
     tag_rows.sort(key=lambda row: (row[0], row[1], row[3].name), reverse=True)
     retained = {(artifact.digest, tag.name) for _, _, artifact, tag in tag_rows[:keep_tags]}
-    logging.debug("Retention sees %d tag(s); keeping %d", len(tag_rows), len(retained))
+    logging.debug("保留策略看到 %d 个 tag，将保留 %d 个", len(tag_rows), len(retained))
 
     artifact_deletes: list[ArtifactRef] = []
     tag_deletes: list[tuple[ArtifactRef, TagRef]] = []
@@ -476,7 +610,7 @@ def retention_plan(artifacts: list[ArtifactRef], keep_tags: int) -> tuple[list[A
     artifact_deletes.sort(key=artifact_sort_key)
     tag_deletes.sort(key=lambda item: item[1].push_time)
     logging.debug(
-        "Retention plan: delete_artifacts=%d delete_tags=%d",
+        "保留策略计划：删除制品=%d，删除 tag=%d",
         len(artifact_deletes),
         len(tag_deletes),
     )
@@ -494,10 +628,10 @@ def process_repository(
 ) -> tuple[int, int, int, int]:
     artifacts = list_artifacts(session, config, repo_name)
     tagged_artifacts = [artifact for artifact in artifacts if artifact.tags]
-    logging.info("%s: %d artifacts, %d tagged", repo_name, len(artifacts), len(tagged_artifacts))
+    logging.info("%s：共 %d 个制品，其中 %d 个带 tag", repo_name, len(artifacts), len(tagged_artifacts))
     for artifact in sorted(tagged_artifacts, key=artifact_sort_key, reverse=True):
         logging.debug(
-            "%s artifact digest=%s size=%s push_time=%s tags=[%s]",
+            "%s 制品 digest=%s size=%s push_time=%s tags=[%s]",
             repo_name,
             short_digest(artifact.digest),
             human_size(artifact.size),
@@ -517,7 +651,7 @@ def process_repository(
                     backed_up += 1
             except Exception:
                 failed += 1
-                logging.exception("Failed to back up %s:%s", repo_name, tag.name)
+                logging.exception("备份失败：%s:%s", repo_name, tag.name)
 
     if not prune:
         return backed_up, deleted_artifacts, deleted_tags, failed
@@ -525,20 +659,20 @@ def process_repository(
     artifact_deletes, tag_deletes = retention_plan(artifacts, config.keep_tags)
     if artifact_deletes or tag_deletes:
         logging.info(
-            "%s retention plan: delete %d artifact(s), delete %d tag(s)",
+            "%s 保留策略计划：删除 %d 个制品，删除 %d 个 tag",
             repo_name,
             len(artifact_deletes),
             len(tag_deletes),
         )
     else:
-        logging.info("%s retention plan: nothing to delete", repo_name)
+        logging.info("%s 保留策略计划：无需删除", repo_name)
 
     for artifact, tag in tag_deletes:
         try:
             if not dry_run and not tag_is_backed_up(config, bucket, artifact, tag):
                 failed += 1
                 logging.error(
-                    "Skip deleting %s:%s because it is not backed up",
+                    "跳过删除 %s:%s，因为尚未完成备份",
                     repo_name,
                     tag.name,
                 )
@@ -547,14 +681,14 @@ def process_repository(
                 deleted_tags += 1
         except Exception:
             failed += 1
-            logging.exception("Failed to delete old tag %s:%s", repo_name, tag.name)
+            logging.exception("删除旧 tag 失败：%s:%s", repo_name, tag.name)
 
     for artifact in artifact_deletes:
         try:
             if not dry_run and not artifact_fully_backed_up(config, bucket, artifact):
                 failed += 1
                 logging.error(
-                    "Skip deleting %s@%s because not all tags are backed up",
+                    "跳过删除 %s@%s，因为不是所有 tag 都已备份",
                     repo_name,
                     artifact.digest,
                 )
@@ -563,7 +697,7 @@ def process_repository(
                 deleted_artifacts += 1
         except Exception:
             failed += 1
-            logging.exception("Failed to delete old artifact %s@%s", repo_name, artifact.digest)
+            logging.exception("删除旧制品失败：%s@%s", repo_name, artifact.digest)
 
     return backed_up, deleted_artifacts, deleted_tags, failed
 
@@ -577,7 +711,7 @@ def lock_file(path: str):
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         handle.close()
-        raise JobError(f"Another sync job is already running: {path}") from exc
+        raise JobError(f"已有同步任务正在运行：{path}") from exc
     try:
         handle.write(str(os.getpid()))
         handle.flush()
@@ -592,7 +726,7 @@ def ensure_tools(dry_run: bool) -> None:
         return
     missing = [tool for tool in ("skopeo",) if shutil.which(tool) is None]
     if missing:
-        raise JobError(f"Missing required command: {', '.join(missing)}")
+        raise JobError(f"缺少必需命令：{', '.join(missing)}")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -603,22 +737,24 @@ def run(args: argparse.Namespace) -> int:
 
     with lock_file(config.lock_file):
         started_at = time.time()
-        logging.info("Starting Harbor -> OSS sync")
-        logging.info("Harbor project: %s", config.harbor_project)
-        logging.info("Harbor registry: %s verify_tls=%s", config.harbor_registry, config.harbor_verify_tls)
-        logging.info("OSS target: oss://%s/%s/", config.oss_bucket, config.oss_prefix)
-        logging.info("Retention: keep latest %d tagged artifacts per repository", config.keep_tags)
+        logging.info("开始执行 Harbor -> OSS 同步")
+        logging.info("Harbor 项目：%s", config.harbor_project)
+        logging.info("Harbor 镜像仓库：%s verify_tls=%s", config.harbor_registry, config.harbor_verify_tls)
+        logging.info("OSS 目标：oss://%s/%s/", config.oss_bucket, config.oss_prefix)
+        logging.info("保留策略：每个仓库保留最新 %d 个带 tag 的制品", config.keep_tags)
         logging.info(
-            "Runtime: tmp_dir=%s override=%s/%s upload_threads=%d repo_filter=%s",
+            "运行参数：tmp_dir=%s 平台=%s/%s 上传并发=%d 仓库过滤=%s 重试=%d 超时=%.1fs",
             config.tmp_dir,
             config.skopeo_override_os,
             config.skopeo_override_arch,
             config.upload_threads,
             config.repo_filter or "<none>",
+            config.network_retries,
+            config.harbor_request_timeout,
         )
-        logging.debug("Lock file: %s", config.lock_file)
+        logging.debug("锁文件：%s", config.lock_file)
         if args.dry_run:
-            logging.info("Dry-run mode is enabled")
+            logging.info("当前为 dry-run 模式")
 
         session = create_harbor_session(config)
         bucket = init_oss_bucket(config)
@@ -627,7 +763,7 @@ def run(args: argparse.Namespace) -> int:
         with tempfile.TemporaryDirectory(prefix="job_", dir=str(tmp_root)) as job_dir:
             auth_file = write_skopeo_auth(config, Path(job_dir))
             repos = list_repositories(session, config)
-            logging.info("Found %d repositories", len(repos))
+            logging.info("发现 %d 个仓库", len(repos))
 
             total_backed_up = 0
             total_deleted_artifacts = 0
@@ -650,7 +786,7 @@ def run(args: argparse.Namespace) -> int:
 
         elapsed = time.time() - started_at
         logging.info(
-            "Finished in %.1fs: backed_up=%d deleted_artifacts=%d deleted_tags=%d failed=%d",
+            "执行完成，用时 %.1fs：已备份=%d 删除制品=%d 删除 tag=%d 失败=%d",
             elapsed,
             total_backed_up,
             total_deleted_artifacts,
@@ -661,16 +797,16 @@ def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Back up Harbor images to OSS and prune old Harbor artifacts")
-    parser.add_argument("--dry-run", action="store_true", help="List work without exporting, uploading, or deleting")
-    parser.add_argument("--no-prune", action="store_true", help="Back up images but do not delete old Harbor artifacts")
-    parser.add_argument("--repo", help="Only process repositories whose full name contains this text")
-    parser.add_argument("--keep-tags", type=int, help="Number of newest tagged artifacts to keep per repository")
+    parser = argparse.ArgumentParser(description="备份 Harbor 镜像到 OSS，并清理旧的 Harbor 制品")
+    parser.add_argument("--dry-run", action="store_true", help="只列出将执行的操作，不导出、不上传、不删除")
+    parser.add_argument("--no-prune", action="store_true", help="只备份镜像，不删除旧的 Harbor 制品")
+    parser.add_argument("--repo", help="只处理全名包含该文本的仓库")
+    parser.add_argument("--keep-tags", type=int, help="每个仓库要保留的最新 tag 数量")
     parser.add_argument(
         "--log-level",
         default=os.getenv("LOG_LEVEL", "INFO"),
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        help="Log verbosity",
+        help="日志级别",
     )
     return parser
 
@@ -679,7 +815,7 @@ def main() -> int:
     try:
         return run(build_parser().parse_args())
     except KeyboardInterrupt:
-        logging.warning("Interrupted")
+        logging.warning("任务已被中断")
         return 130
     except Exception as exc:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)

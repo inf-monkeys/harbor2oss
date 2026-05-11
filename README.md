@@ -69,6 +69,9 @@ TZ=Asia/Shanghai
 TMP_DIR=/tmp/harbor2oss
 OSS_PREFIX=Images (backup from harbor.d.run)
 OSS_UPLOAD_THREADS=4
+NETWORK_RETRIES=3
+RETRY_BASE_DELAY_SECONDS=5
+HARBOR_REQUEST_TIMEOUT=60
 SKOPEO_OVERRIDE_OS=linux
 SKOPEO_OVERRIDE_ARCH=amd64
 HARBOR_VERIFY_TLS=false
@@ -76,6 +79,9 @@ REPO_FILTER=
 JOB_ARGS=
 LOG_LEVEL=DEBUG
 ```
+
+`NETWORK_RETRIES` applies to Harbor API requests and OSS uploads. Retries use
+exponential backoff starting at `RETRY_BASE_DELAY_SECONDS`.
 
 ## Local Dry Run
 
