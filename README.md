@@ -124,6 +124,14 @@ JOB_ARGS=--repo my-service --no-prune
 
 ## Container
 
+Prebuilt multi-architecture images are available on Docker Hub:
+
+```text
+ruiruiz30/harbor2oss:latest
+```
+
+The image supports `linux/amd64` and `linux/arm64`.
+
 Build the image:
 
 ```bash
@@ -133,10 +141,22 @@ docker build -t harbor-to-oss-backup .
 Run once:
 
 ```bash
+docker run --rm --env-file .env ruiruiz30/harbor2oss:latest python /app/harbor2oss_sync.py --no-prune
+```
+
+Or with a locally built image:
+
+```bash
 docker run --rm --env-file .env harbor-to-oss-backup python /app/harbor2oss_sync.py --no-prune
 ```
 
 Run with the bundled cron entrypoint:
+
+```bash
+docker run --rm --env-file .env ruiruiz30/harbor2oss:latest
+```
+
+Or with a locally built image:
 
 ```bash
 docker run --rm --env-file .env harbor-to-oss-backup

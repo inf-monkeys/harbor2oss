@@ -120,6 +120,14 @@ JOB_ARGS=--repo my-service --no-prune
 
 ## 容器
 
+Docker Hub 提供了预构建的多架构镜像：
+
+```text
+ruiruiz30/harbor2oss:latest
+```
+
+该镜像支持 `linux/amd64` 和 `linux/arm64`。
+
 构建镜像：
 
 ```bash
@@ -129,10 +137,22 @@ docker build -t harbor-to-oss-backup .
 运行一次：
 
 ```bash
+docker run --rm --env-file .env ruiruiz30/harbor2oss:latest python /app/harbor2oss_sync.py --no-prune
+```
+
+或使用本地构建的镜像：
+
+```bash
 docker run --rm --env-file .env harbor-to-oss-backup python /app/harbor2oss_sync.py --no-prune
 ```
 
 使用内置 cron 入口运行：
+
+```bash
+docker run --rm --env-file .env ruiruiz30/harbor2oss:latest
+```
+
+或使用本地构建的镜像：
 
 ```bash
 docker run --rm --env-file .env harbor-to-oss-backup
