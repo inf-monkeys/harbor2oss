@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 ARG SUPERCRONIC_VERSION=v0.2.33
 ARG TARGETARCH
@@ -12,9 +13,16 @@ ENV PYTHONUNBUFFERED=1 \
     LOG_LEVEL=INFO \
     LOG_LANGUAGE=en
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl skopeo tzdata \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+      apt-get update -o Acquire::Retries=3 \
+      && apt-get install -y --no-install-recommends -o Acquire::Retries=3 ca-certificates curl skopeo tzdata \
+      && rm -rf /var/lib/apt/lists/* \
+      && break; \
+      if [ "$attempt" = "5" ]; then exit 1; fi; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep $((attempt * 5)); \
+    done
 
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
@@ -22,7 +30,12 @@ RUN set -eux; \
       arm64) supercronic_arch=arm64 ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /usr/local/bin/supercronic "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${supercronic_arch}"; \
+    for attempt in 1 2 3 4 5; do \
+      curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL -o /usr/local/bin/supercronic "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${supercronic_arch}" \
+      && break; \
+      if [ "$attempt" = "5" ]; then exit 1; fi; \
+      sleep $((attempt * 5)); \
+    done; \
     chmod +x /usr/local/bin/supercronic
 
 WORKDIR /app

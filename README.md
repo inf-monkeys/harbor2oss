@@ -9,11 +9,11 @@ they are present in OSS.
 ## Features
 
 - Lists repositories in one Harbor project.
-- Exports missing image tags with `skopeo`.
+- Exports old, prunable image tags with `skopeo` when pruning is enabled.
 - Uploads image archives to OSS, using multipart upload for large files.
 - Retries transient Harbor and OSS network failures with exponential backoff.
 - Keeps the newest `KEEP_TAGS` tags per repository.
-- Deletes old Harbor artifacts only after their tags are confirmed in OSS.
+- Deletes each old Harbor tag or artifact as soon as its backup is confirmed in OSS.
 - Runs as a one-off script or as a container with an in-container cron schedule.
 - Supports English logs by default and Chinese logs with `LOG_LANGUAGE=zh`.
 
@@ -21,6 +21,12 @@ they are present in OSS.
 
 The script sorts tags by Harbor `push_time` and keeps the newest `KEEP_TAGS`
 tags per repository.
+
+When pruning is enabled, the script plans the retained tags first, then processes
+only the old tags and artifacts from oldest to newest. It backs up each old tag
+to OSS, confirms the OSS object exists, and immediately deletes the old Harbor
+tag or artifact before moving on. This releases Harbor metadata sooner than
+waiting for every tag in the repository to be backed up.
 
 If all tags on an old artifact are outside the retention window, the script
 deletes the artifact:

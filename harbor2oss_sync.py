@@ -2,8 +2,8 @@
 """
 Harbor image backup and retention job for container platforms.
 
-The job copies images from Harbor to Aliyun OSS with skopeo, then prunes old
-Harbor artifacts after confirming they are already backed up.
+The job copies old Harbor images to Aliyun OSS with skopeo and prunes each old
+tag or artifact as soon as its backup is confirmed.
 """
 
 import argparse
@@ -79,6 +79,15 @@ class ArtifactRef:
 
 class JobError(RuntimeError):
     pass
+
+
+class HarborDeleteForbidden(JobError):
+    pass
+
+
+class NoCookieJar(requests.cookies.RequestsCookieJar):
+    def set_cookie(self, cookie, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
 
 
 def normalize_log_language(value: str | None) -> str:
@@ -204,6 +213,7 @@ def create_harbor_session(config: Config) -> requests.Session:
     session = requests.Session()
     session.auth = (config.harbor_user, config.harbor_password)
     session.verify = config.harbor_verify_tls
+    session.cookies = NoCookieJar()
     if not config.harbor_verify_tls:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return session
@@ -221,12 +231,23 @@ def retryable_harbor_error(exc: requests.exceptions.RequestException) -> bool:
     return False
 
 
+def response_body_snippet(response: requests.Response | None) -> str:
+    if response is None:
+        return "<no response>"
+    body = (response.text or "").strip().replace("\n", " ")
+    return body[:500] if body else "<empty response>"
+
+
 def api_request(session: requests.Session, config: Config, method: str, url: str, **kwargs) -> requests.Response:
     attempts = config.network_retries + 1
     for attempt in range(1, attempts + 1):
         try:
             response = session.request(method, url, timeout=config.harbor_request_timeout, **kwargs)
-            response.raise_for_status()
+            if not response.ok:
+                raise requests.exceptions.HTTPError(
+                    f"{response.status_code} {response.reason} for {method.upper()} {url}; response={response_body_snippet(response)!r}",
+                    response=response,
+                )
             return response
         except requests.exceptions.RequestException as exc:
             if attempt >= attempts or not retryable_harbor_error(exc):
@@ -249,7 +270,22 @@ def api_get(session: requests.Session, config: Config, url: str, **kwargs) -> re
 
 
 def api_delete(session: requests.Session, config: Config, url: str, **kwargs) -> requests.Response:
+    session.cookies.clear()
+    kwargs.setdefault("cookies", {})
     return api_request(session, config, "DELETE", url, **kwargs)
+
+
+def raise_delete_forbidden(config: Config, target: str, exc: requests.exceptions.HTTPError) -> None:
+    response = exc.response
+    if response is None or response.status_code != 403:
+        return
+    raise HarborDeleteForbidden(
+        text(
+            config,
+            f"Harbor denied DELETE for {target}. Check that HARBOR_USER has delete permission in project {config.harbor_project}, and check immutable tag or project policy rules. Harbor response: {response_body_snippet(response)}",
+            f"Harbor 拒绝删除 {target}。请确认 HARBOR_USER 在项目 {config.harbor_project} 中有删除权限，并检查不可变 tag 或项目策略。Harbor 返回：{response_body_snippet(response)}",
+        )
+    ) from exc
 
 
 def list_repositories(session: requests.Session, config: Config) -> list[str]:
@@ -331,8 +367,18 @@ def artifact_sort_key(artifact: ArtifactRef) -> datetime:
     return artifact.push_time
 
 
+def artifact_oldest_tag_sort_key(artifact: ArtifactRef) -> datetime:
+    if artifact.tags:
+        return min(tag.push_time for tag in artifact.tags)
+    return artifact.push_time
+
+
 def iter_tag_backups(artifact: ArtifactRef) -> Iterable[TagRef]:
     return sorted(artifact.tags, key=lambda tag: tag.push_time, reverse=True)
+
+
+def iter_tag_backups_oldest_first(artifact: ArtifactRef) -> Iterable[TagRef]:
+    return sorted(artifact.tags, key=lambda tag: tag.push_time)
 
 
 def oss_key_for(config: Config, repo_path: str, tag: str) -> str:
@@ -571,11 +617,15 @@ def delete_artifact(session: requests.Session, config: Config, artifact: Artifac
     if dry_run:
         logging.info(text(config, "[dry-run] would delete artifact %s/%s@%s tags=[%s]", "[dry-run] 将删除制品 %s/%s@%s tags=[%s]"), config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
         return False
-    response = api_delete(
-        session,
-        config,
-        f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}",
-    )
+    try:
+        api_delete(
+            session,
+            config,
+            f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}",
+        )
+    except requests.exceptions.HTTPError as exc:
+        raise_delete_forbidden(config, f"{config.harbor_project}/{artifact.repo_path}@{artifact.digest}", exc)
+        raise
     logging.info(text(config, "Deleted artifact %s/%s@%s tags=[%s]", "已删除制品 %s/%s@%s tags=[%s]"), config.harbor_project, artifact.repo_path, artifact.digest, tag_names)
     return True
 
@@ -588,11 +638,15 @@ def delete_tag(session: requests.Session, config: Config, artifact: ArtifactRef,
     if dry_run:
         logging.info(text(config, "[dry-run] would delete tag %s/%s:%s", "[dry-run] 将删除 tag %s/%s:%s"), config.harbor_project, artifact.repo_path, tag.name)
         return False
-    response = api_delete(
-        session,
-        config,
-        f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}/tags/{encoded_tag}",
-    )
+    try:
+        api_delete(
+            session,
+            config,
+            f"{config.harbor_url}/api/v2.0/projects/{config.harbor_project}/repositories/{encoded_repo}/artifacts/{encoded_digest}/tags/{encoded_tag}",
+        )
+    except requests.exceptions.HTTPError as exc:
+        raise_delete_forbidden(config, f"{config.harbor_project}/{artifact.repo_path}:{tag.name}", exc)
+        raise
     logging.info(text(config, "Deleted tag %s/%s:%s", "已删除 tag %s/%s:%s"), config.harbor_project, artifact.repo_path, tag.name)
     return True
 
@@ -601,7 +655,10 @@ def tag_is_backed_up(config: Config, bucket: oss2.Bucket, artifact: ArtifactRef,
     return oss_exists(config, bucket, oss_key_for(config, artifact.repo_path, tag.name))
 
 
-def retention_plan(artifacts: list[ArtifactRef], keep_tags: int) -> tuple[list[ArtifactRef], list[tuple[ArtifactRef, TagRef]]]:
+def retention_plan(
+    artifacts: list[ArtifactRef],
+    keep_tags: int,
+) -> tuple[list[ArtifactRef], list[tuple[ArtifactRef, TagRef]], list[tuple[ArtifactRef, TagRef]]]:
     tag_rows: list[tuple[datetime, str, ArtifactRef, TagRef]] = []
     for artifact in artifacts:
         for tag in artifact.tags:
@@ -613,25 +670,30 @@ def retention_plan(artifacts: list[ArtifactRef], keep_tags: int) -> tuple[list[A
 
     artifact_deletes: list[ArtifactRef] = []
     tag_deletes: list[tuple[ArtifactRef, TagRef]] = []
+    retained_tag_rows: list[tuple[ArtifactRef, TagRef]] = []
     for artifact in artifacts:
         if not artifact.tags:
             continue
-        retained_tags = [tag for tag in artifact.tags if (artifact.digest, tag.name) in retained]
-        if retained_tags:
+        artifact_retained_tags = [tag for tag in artifact.tags if (artifact.digest, tag.name) in retained]
+        if artifact_retained_tags:
             for tag in artifact.tags:
-                if (artifact.digest, tag.name) not in retained:
+                if (artifact.digest, tag.name) in retained:
+                    retained_tag_rows.append((artifact, tag))
+                else:
                     tag_deletes.append((artifact, tag))
         else:
             artifact_deletes.append(artifact)
 
-    artifact_deletes.sort(key=artifact_sort_key)
+    artifact_deletes.sort(key=artifact_oldest_tag_sort_key)
     tag_deletes.sort(key=lambda item: item[1].push_time)
+    retained_tag_rows.sort(key=lambda item: item[1].push_time)
     logging.debug(
-        text(None, "Retention plan: delete_artifacts=%d delete_tags=%d", "保留策略计划：删除制品=%d，删除 tag=%d"),
+        text(None, "Retention plan: delete_artifacts=%d delete_tags=%d retain_tags=%d", "保留策略计划：删除制品=%d，删除 tag=%d，保留 tag=%d"),
         len(artifact_deletes),
         len(tag_deletes),
+        len(retained_tag_rows),
     )
-    return artifact_deletes, tag_deletes
+    return artifact_deletes, tag_deletes, retained_tag_rows
 
 
 def process_repository(
@@ -661,46 +723,83 @@ def process_repository(
     deleted_tags = 0
     failed = 0
 
-    for artifact in sorted(tagged_artifacts, key=artifact_sort_key, reverse=True):
-        for tag in iter_tag_backups(artifact):
-            try:
-                if backup_tag(config, bucket, auth_file, artifact, tag, dry_run):
-                    backed_up += 1
-            except Exception:
-                failed += 1
-                logging.exception(text(config, "Failed to back up %s:%s", "备份失败：%s:%s"), repo_name, tag.name)
-
     if not prune:
+        for artifact in sorted(tagged_artifacts, key=artifact_sort_key, reverse=True):
+            for tag in iter_tag_backups(artifact):
+                try:
+                    if backup_tag(config, bucket, auth_file, artifact, tag, dry_run):
+                        backed_up += 1
+                except Exception:
+                    failed += 1
+                    logging.exception(text(config, "Failed to back up %s:%s", "备份失败：%s:%s"), repo_name, tag.name)
         return backed_up, deleted_artifacts, deleted_tags, failed
 
-    artifact_deletes, tag_deletes = retention_plan(artifacts, config.keep_tags)
+    artifact_deletes, tag_deletes, retained_tags = retention_plan(artifacts, config.keep_tags)
     if artifact_deletes or tag_deletes:
         logging.info(
-            text(config, "%s retention plan: delete %d artifact(s), delete %d tag(s)", "%s 保留策略计划：删除 %d 个制品，删除 %d 个 tag"),
+            text(
+                config,
+                "%s retention plan: delete %d artifact(s), delete %d tag(s), retain %d newest tag(s)",
+                "%s 保留策略计划：删除 %d 个制品，删除 %d 个 tag，保留最新 %d 个 tag",
+            ),
             repo_name,
             len(artifact_deletes),
             len(tag_deletes),
+            len(retained_tags),
         )
     else:
         logging.info(text(config, "%s retention plan: nothing to delete", "%s 保留策略计划：无需删除"), repo_name)
 
-    for artifact, tag in tag_deletes:
-        try:
-            if not dry_run and not tag_is_backed_up(config, bucket, artifact, tag):
-                failed += 1
-                logging.error(
-                    text(config, "Skip deleting %s:%s because it is not backed up", "跳过删除 %s:%s，因为尚未完成备份"),
-                    repo_name,
-                    tag.name,
-                )
-                continue
-            if delete_tag(session, config, artifact, tag, dry_run):
-                deleted_tags += 1
-        except Exception:
-            failed += 1
-            logging.exception(text(config, "Failed to delete old tag %s:%s", "删除旧 tag 失败：%s:%s"), repo_name, tag.name)
+    delete_steps: list[tuple[datetime, str, ArtifactRef, TagRef | None]] = [
+        (artifact_oldest_tag_sort_key(artifact), "artifact", artifact, None) for artifact in artifact_deletes
+    ]
+    delete_steps.extend((tag.push_time, "tag", artifact, tag) for artifact, tag in tag_deletes)
+    delete_steps.sort(key=lambda step: (step[0], artifact_oldest_tag_sort_key(step[2]), step[2].digest, step[3].name if step[3] else ""))
 
-    for artifact in artifact_deletes:
+    for _, kind, artifact, tag in delete_steps:
+        if kind == "tag" and tag is not None:
+            try:
+                if backup_tag(config, bucket, auth_file, artifact, tag, dry_run):
+                    backed_up += 1
+                if not dry_run and not tag_is_backed_up(config, bucket, artifact, tag):
+                    failed += 1
+                    logging.error(
+                        text(config, "Skip deleting %s:%s because it is not backed up", "跳过删除 %s:%s，因为尚未完成备份"),
+                        repo_name,
+                        tag.name,
+                    )
+                    continue
+                if delete_tag(session, config, artifact, tag, dry_run):
+                    deleted_tags += 1
+            except Exception:
+                failed += 1
+                logging.exception(text(config, "Failed to back up or delete old tag %s:%s", "备份或删除旧 tag 失败：%s:%s"), repo_name, tag.name)
+                if isinstance(sys.exc_info()[1], HarborDeleteForbidden):
+                    raise
+            continue
+
+        artifact_backup_failed = False
+        for old_tag in iter_tag_backups_oldest_first(artifact):
+            try:
+                if backup_tag(config, bucket, auth_file, artifact, old_tag, dry_run):
+                    backed_up += 1
+            except Exception:
+                failed += 1
+                artifact_backup_failed = True
+                logging.exception(text(config, "Failed to back up %s:%s", "备份失败：%s:%s"), repo_name, old_tag.name)
+
+        if artifact_backup_failed:
+            logging.error(
+                text(
+                    config,
+                    "Skip deleting %s@%s because at least one old tag failed to back up",
+                    "跳过删除 %s@%s，因为至少一个旧 tag 备份失败",
+                ),
+                repo_name,
+                artifact.digest,
+            )
+            continue
+
         try:
             if not dry_run and not artifact_fully_backed_up(config, bucket, artifact):
                 failed += 1
@@ -715,6 +814,8 @@ def process_repository(
         except Exception:
             failed += 1
             logging.exception(text(config, "Failed to delete old artifact %s@%s", "删除旧制品失败：%s@%s"), repo_name, artifact.digest)
+            if isinstance(sys.exc_info()[1], HarborDeleteForbidden):
+                raise
 
     return backed_up, deleted_artifacts, deleted_tags, failed
 
@@ -758,7 +859,7 @@ def run(args: argparse.Namespace) -> int:
         logging.info(text(config, "Harbor project: %s", "Harbor 项目：%s"), config.harbor_project)
         logging.info(text(config, "Harbor registry: %s verify_tls=%s", "Harbor 镜像仓库：%s verify_tls=%s"), config.harbor_registry, config.harbor_verify_tls)
         logging.info(text(config, "OSS target: oss://%s/%s/", "OSS 目标：oss://%s/%s/"), config.oss_bucket, config.oss_prefix)
-        logging.info(text(config, "Retention: keep latest %d tagged artifacts per repository", "保留策略：每个仓库保留最新 %d 个带 tag 的制品"), config.keep_tags)
+        logging.info(text(config, "Retention: keep latest %d tag(s) per repository", "保留策略：每个仓库保留最新 %d 个 tag"), config.keep_tags)
         logging.info(
             text(config, "Runtime: tmp_dir=%s platform=%s/%s upload_threads=%d repo_filter=%s retries=%d timeout=%.1fs log_language=%s", "运行参数：tmp_dir=%s 平台=%s/%s 上传并发=%d 仓库过滤=%s 重试=%d 超时=%.1fs 日志语言=%s"),
             config.tmp_dir,
