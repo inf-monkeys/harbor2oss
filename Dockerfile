@@ -1,4 +1,15 @@
 ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE} AS python-wheels
+
+# Official Python images already include the matching Python headers. Build on
+# the target architecture so crcmod cannot silently fall back to Python-only CRC.
+RUN apt-get update -o Acquire::Retries=3 \
+    && apt-get install -y --no-install-recommends -o Acquire::Retries=3 gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /build/requirements.txt
+RUN pip wheel --no-cache-dir --no-binary=crcmod --wheel-dir=/wheels -r /build/requirements.txt
+
 FROM ${PYTHON_IMAGE}
 
 ARG SUPERCRONIC_VERSION=v0.2.33
@@ -41,7 +52,12 @@ RUN set -eux; \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY --from=python-wheels /wheels /wheels
+RUN pip install --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY verify_native_crc.py ./
+RUN python /app/verify_native_crc.py
 
 COPY harbor2oss_sync.py entrypoint.sh ./
 RUN chmod +x /app/harbor2oss_sync.py /app/entrypoint.sh \

@@ -144,6 +144,20 @@ Build the image:
 docker build -t harbor-to-oss-backup .
 ```
 
+The build compiles `crcmod`'s native C extension for the target architecture in a
+separate stage; compilers are not installed in the runtime image. CRC-64 integrity
+checks remain enabled. The build fails if the native extension cannot load, the
+Python fallback is selected, or the OSS CRC-64 checksum verification fails.
+
+Verify an image without credentials or a network connection:
+
+```bash
+docker run --rm --network none --entrypoint python harbor-to-oss-backup /app/verify_native_crc.py
+```
+
+Rebuild the image after changing the Python version or target architecture; do
+not reuse a compiled extension from a different Python ABI or platform.
+
 Run once:
 
 ```bash

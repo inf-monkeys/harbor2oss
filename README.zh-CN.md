@@ -138,6 +138,18 @@ ruiruiz30/harbor2oss:latest
 docker build -t harbor-to-oss-backup .
 ```
 
+构建时会在独立阶段为目标架构编译 `crcmod` 的原生 C 扩展，运行镜像不安装编译器，
+CRC-64 完整性校验保持启用。如果原生扩展无法加载、退回纯 Python 实现，或 OSS CRC-64
+校验结果不正确，镜像构建会直接失败。
+
+无需凭据或网络连接即可验证镜像：
+
+```bash
+docker run --rm --network none --entrypoint python harbor-to-oss-backup /app/verify_native_crc.py
+```
+
+更换 Python 版本或目标架构后需要重新构建镜像，不要复用不同 Python ABI 或平台的扩展文件。
+
 运行一次：
 
 ```bash
